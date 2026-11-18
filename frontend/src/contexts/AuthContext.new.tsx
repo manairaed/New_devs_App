@@ -5,6 +5,7 @@ import { authOptimizer } from '../utils/authOptimizer';
 import { sessionRecovery } from '../utils/sessionRecovery';
 import { sessionPersistenceManager } from '../utils/SessionPersistenceManager';
 import { extractTenantFromSession } from '../utils/jwtUtils';
+import { SecureAPI } from '../lib/secureApi';
 
 // Global logout flag to prevent session recovery during logout
 if (typeof window !== 'undefined') {
@@ -275,7 +276,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // 1. Clear storage IMMEDIATELY before anything else
       localStorage.clear();
       sessionStorage.clear();
-      console.log('[AuthContext] Storage cleared');
+      SecureAPI.clearCache();
+      console.log('[AuthContext] Storage and SecureAPI cache cleared');
 
       // 2. Stop session persistence manager
       sessionPersistenceManager.stop();
@@ -310,6 +312,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       try {
         localStorage.clear();
         sessionStorage.clear();
+        SecureAPI.clearCache();
         sessionPersistenceManager.stop();
         sessionRecovery.clearStoredSession();
         authOptimizer.clearSession();

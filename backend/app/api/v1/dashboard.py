@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from typing import Dict, Any
 from app.services.cache import get_revenue_summary
 from app.core.auth import authenticate_request as get_current_user
@@ -8,10 +8,20 @@ router = APIRouter()
 @router.get("/dashboard/summary")
 async def get_dashboard_summary(
     property_id: str,
-    current_user: dict = Depends(get_current_user)
+    current_user: Any = Depends(get_current_user)
 ) -> Dict[str, Any]:
     
-    tenant_id = getattr(current_user, "tenant_id", "default_tenant") or "default_tenant"
+    tenant_id = None
+    if isinstance(current_user, dict):
+        tenant_id = current_user.get("tenant_id")
+    else:
+        tenant_id = getattr(current_user, "tenant_id", None)
+
+    if not tenant_id or tenant_id == "default_tenant":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication context is missing a valid tenant_id"
+        )
     
     revenue_data = await get_revenue_summary(property_id, tenant_id)
     
