@@ -239,6 +239,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const signIn = async (email: string, password: string) => {
     try {
+      // Clear cache before sign in to ensure no previous tenant cache lingers
+      SecureAPI.clearCache();
+
       const { data, error } = await supabase.auth.signInWithPassword({
         email,
         password,

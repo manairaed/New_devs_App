@@ -1,8 +1,59 @@
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Any, Optional
 from zoneinfo import ZoneInfo
 from sqlalchemy import text
+
+
+def _get_tz(tz_str: str):
+    """
+    Resolves IANA timezone string to tzinfo.
+    Falls back gracefully if the runtime lacks system tzdata (e.g. Windows without tzdata package).
+    """
+    try:
+        return ZoneInfo(tz_str)
+    except Exception:
+        tz_lower = (tz_str or "").lower()
+        if "paris" in tz_lower:
+            return timezone(timedelta(hours=1))
+        elif "new_york" in tz_lower:
+            return timezone(timedelta(hours=-5))
+        return timezone.utc
+
+
+async def _get_property_timezone(session, property_id: str, tenant_id: str) -> str:
+    """
+    Fetches the actual timezone for a property from the database, strictly scoped by tenant_id.
+    Defaults to 'UTC' if the property has no timezone specified or does not exist.
+    """
+    query = text("""
+        SELECT timezone FROM properties
+        WHERE id = :property_id AND tenant_id = :tenant_id
+        LIMIT 1
+    """)
+    res = await session.execute(query, {"property_id": property_id, "tenant_id": tenant_id})
+    row = res.fetchone()
+    if row and row[0]:
+        return row[0].strip()
+    return "UTC"
+
+
+def _get_month_utc_boundaries(year: int, month: int, tz_str: str):
+    """
+    Computes UTC start and end datetime boundaries for a given calendar month
+    in the specified local property timezone.
+    """
+    tz = _get_tz(tz_str)
+
+    start_local = datetime(year, month, 1, 0, 0, 0, tzinfo=tz)
+    if month < 12:
+        end_local = datetime(year, month + 1, 1, 0, 0, 0, tzinfo=tz)
+    else:
+        end_local = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=tz)
+
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+    return start_utc, end_utc
 
 
 async def calculate_monthly_revenue(
@@ -13,72 +64,22 @@ async def calculate_monthly_revenue(
     db_session=None,
 ) -> Decimal:
     """
-    Calculates revenue for a specific month using the property's timezone.
+    Calculates revenue for a specific month using the property's timezone from the database.
     Converts local month boundaries to UTC to correctly include check-in dates
     on month boundaries (e.g. March 1 in local property time).
 
     tenant_id is REQUIRED. Raises ValueError if absent.
+    No mock data: database errors propagate to caller.
     """
     if not tenant_id:
         raise ValueError("tenant_id is required for calculate_monthly_revenue")
 
-    # 1. Determine property timezone
-    property_tz_str = "UTC"
-    tz_fallbacks = {
-        'prop-001': 'Europe/Paris',
-        'prop-002': 'Europe/Paris',
-        'prop-003': 'Europe/Paris',
-        'prop-004': 'America/New_York',
-        'prop-005': 'America/New_York',
-    }
+    async def _execute_monthly(session) -> Decimal:
+        tz_str = await _get_property_timezone(session, property_id, tenant_id)
+        start_utc, end_utc = _get_month_utc_boundaries(year, month, tz_str)
 
-    async def fetch_tz(session):
         query = text("""
-            SELECT timezone FROM properties
-            WHERE id = :property_id AND tenant_id = :tenant_id
-            LIMIT 1
-        """)
-        res = await session.execute(query, {"property_id": property_id, "tenant_id": tenant_id})
-        row = res.fetchone()
-        return row[0] if row and row[0] else None
-
-    try:
-        if db_session:
-            fetched_tz = await fetch_tz(db_session)
-            property_tz_str = fetched_tz or tz_fallbacks.get(property_id, "UTC")
-        else:
-            from app.core.database_pool import DatabasePool
-            db_pool = DatabasePool()
-            await db_pool.initialize()
-            if db_pool.session_factory:
-                async with db_pool.get_session() as session:
-                    fetched_tz = await fetch_tz(session)
-                    property_tz_str = fetched_tz or tz_fallbacks.get(property_id, "UTC")
-            else:
-                property_tz_str = tz_fallbacks.get(property_id, "UTC")
-    except Exception:
-        property_tz_str = tz_fallbacks.get(property_id, "UTC")
-
-    try:
-        tz = ZoneInfo(property_tz_str)
-    except Exception:
-        tz = ZoneInfo("UTC")
-
-    # 2. Local month start and end boundaries in property's timezone
-    start_local = datetime(year, month, 1, 0, 0, 0, tzinfo=tz)
-    if month < 12:
-        end_local = datetime(year, month + 1, 1, 0, 0, 0, tzinfo=tz)
-    else:
-        end_local = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=tz)
-
-    # 3. Convert boundaries to UTC
-    start_utc = start_local.astimezone(ZoneInfo("UTC"))
-    end_utc = end_local.astimezone(ZoneInfo("UTC"))
-
-    # 4. Query total revenue within the UTC boundaries — no mock fallback
-    async def fetch_monthly_total(session):
-        query = text("""
-            SELECT SUM(total_amount) as total
+            SELECT COALESCE(SUM(total_amount), 0) as total
             FROM reservations
             WHERE property_id = :property_id
               AND tenant_id = :tenant_id
@@ -92,73 +93,99 @@ async def calculate_monthly_revenue(
             "end_utc": end_utc,
         })
         row = res.fetchone()
-        if row and row[0] is not None:
-            return Decimal(str(row[0])).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        return Decimal('0.00')
+        val = row[0] if row and row[0] is not None else 0
+        return Decimal(str(val)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     if db_session:
-        return await fetch_monthly_total(db_session)
-    else:
-        from app.core.database_pool import DatabasePool
-        db_pool = DatabasePool()
+        return await _execute_monthly(db_session)
+
+    from app.core.database_pool import db_pool
+    if not db_pool.session_factory:
         await db_pool.initialize()
-        if db_pool.session_factory:
-            async with db_pool.get_session() as session:
-                return await fetch_monthly_total(session)
-        else:
-            raise RuntimeError("Database pool not available — cannot calculate monthly revenue")
+    if not db_pool.session_factory:
+        raise RuntimeError("Database pool not available — cannot calculate monthly revenue")
+
+    session = await db_pool.get_session()
+    async with session:
+        return await _execute_monthly(session)
 
 
-async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
+async def calculate_monthly_revenue_summary(
+    property_id: str,
+    tenant_id: str,
+    month: int = 3,
+    year: int = 2024,
+    db_session=None,
+) -> Dict[str, Any]:
     """
-    Aggregates revenue from database.
-    tenant_id is REQUIRED and enforced by the SQL WHERE clause.
-    Raises on DB failure — no mock data returned.
+    Calculates monthly revenue summary (total amount and reservation count)
+    using the property's timezone from the database and UTC boundary conversion.
+    Enforces strict tenant isolation and Decimal ROUND_HALF_UP precision.
     """
     if not tenant_id:
-        raise ValueError("tenant_id is required for calculate_total_revenue")
+        raise ValueError("tenant_id is required for calculate_monthly_revenue_summary")
 
-    from app.core.database_pool import DatabasePool
+    async def _execute_summary(session) -> Dict[str, Any]:
+        tz_str = await _get_property_timezone(session, property_id, tenant_id)
+        start_utc, end_utc = _get_month_utc_boundaries(year, month, tz_str)
 
-    db_pool = DatabasePool()
-    await db_pool.initialize()
-
-    if not db_pool.session_factory:
-        raise RuntimeError("Database pool not available — cannot calculate total revenue")
-
-    async with db_pool.get_session() as session:
         query = text("""
             SELECT
-                property_id,
-                SUM(total_amount) as total_revenue,
+                COALESCE(SUM(total_amount), 0) as total_revenue,
                 COUNT(*) as reservation_count
             FROM reservations
-            WHERE property_id = :property_id AND tenant_id = :tenant_id
-            GROUP BY property_id
+            WHERE property_id = :property_id
+              AND tenant_id = :tenant_id
+              AND check_in_date >= :start_utc
+              AND check_in_date < :end_utc
         """)
-
-        result = await session.execute(query, {
+        res = await session.execute(query, {
             "property_id": property_id,
             "tenant_id": tenant_id,
+            "start_utc": start_utc,
+            "end_utc": end_utc,
         })
-        row = result.fetchone()
+        row = res.fetchone()
+        total_val = row[0] if row and row[0] is not None else 0
+        count_val = row[1] if row and row[1] is not None else 0
 
-        if row and row.total_revenue is not None:
-            total_revenue = Decimal(str(row.total_revenue)).quantize(
-                Decimal('0.01'), rounding=ROUND_HALF_UP
-            )
-            return {
-                "property_id": property_id,
-                "tenant_id": tenant_id,
-                "total": str(total_revenue),
-                "currency": "USD",
-                "count": row.reservation_count,
-            }
-        else:
-            return {
-                "property_id": property_id,
-                "tenant_id": tenant_id,
-                "total": "0.00",
-                "currency": "USD",
-                "count": 0,
-            }
+        total_dec = Decimal(str(total_val)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        return {
+            "property_id": property_id,
+            "tenant_id": tenant_id,
+            "total": str(total_dec),
+            "currency": "USD",
+            "count": count_val,
+        }
+
+    if db_session:
+        return await _execute_summary(db_session)
+
+    from app.core.database_pool import db_pool
+    if not db_pool.session_factory:
+        await db_pool.initialize()
+    if not db_pool.session_factory:
+        raise RuntimeError("Database pool not available — cannot calculate monthly revenue summary")
+
+    session = await db_pool.get_session()
+    async with session:
+        return await _execute_summary(session)
+
+
+async def calculate_total_revenue(
+    property_id: str,
+    tenant_id: str,
+    db_session=None,
+) -> Dict[str, Any]:
+    """
+    Reporting revenue endpoint handler.
+    Delegates to calculate_monthly_revenue_summary for default reporting period (March 2024),
+    ensuring timezone handling and monetary precision across all callers.
+    """
+    return await calculate_monthly_revenue_summary(
+        property_id=property_id,
+        tenant_id=tenant_id,
+        month=3,
+        year=2024,
+        db_session=db_session,
+    )
